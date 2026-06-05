@@ -4,3 +4,5 @@ out
 .env*.local
 *.log
 .env
+
+/lib/generated/prisma

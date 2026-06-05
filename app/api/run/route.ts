@@ -3,21 +3,26 @@ import { NextResponse } from "next/server";
 import type { GeneratedApp } from "@/lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const TEN_MINUTES_MS = 10 * 60 * 1000;
 const WORKDIR = "/home/user/app";
-const FRONTEND_FALLBACK_COMMAND =
-  "python3 -m http.server 3000 --bind 0.0.0.0";
+
+const FORCED_VITE_CONFIG = `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({
+  plugins: [react()],
+  server: { host: '0.0.0.0', port: 3000, allowedHosts: true, hmr: { clientPort: 443 } },
+});
+`;
 
 function isGeneratedApp(value: unknown): value is GeneratedApp {
   if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<GeneratedApp>;
+  const c = value as Partial<GeneratedApp>;
   return (
-    !!candidate.files &&
-    typeof candidate.files === "object" &&
-    Array.isArray(candidate.install_commands) &&
-    Array.isArray(candidate.start_commands)
+    !!c.files && typeof c.files === "object" &&
+    Array.isArray(c.install_commands) &&
+    Array.isArray(c.start_commands)
   );
 }
 
@@ -29,146 +34,81 @@ function toWebsocketUrl(url: string) {
   return url.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
 }
 
-function replaceQuotedPlaceholders(
-  content: string,
-  values: string[],
-  replacement: string
-) {
-  let patched = content;
-
-  for (const value of values) {
-    for (const quote of ['"', "'", "`"]) {
-      patched = patched.split(`${quote}${value}${quote}`).join(
-        `${quote}${replacement}${quote}`
-      );
-    }
-  }
-
-  return patched;
+function patchContent(content: string, backendUrl: string) {
+  const wsUrl = toWebsocketUrl(backendUrl);
+  const httpPatterns = [
+    "BACKEND_URL", "http://BACKEND_URL", "https://BACKEND_URL",
+    "http://localhost:8000", "https://localhost:8000", "localhost:8000",
+    "http://127.0.0.1:8000", "https://127.0.0.1:8000", "127.0.0.1:8000",
+  ];
+  const wsPatterns = [
+    "WS_BACKEND_URL", "ws://WS_BACKEND_URL", "wss://WS_BACKEND_URL",
+    "ws://BACKEND_URL", "wss://BACKEND_URL",
+    "ws://localhost:8000", "wss://localhost:8000",
+    "ws://127.0.0.1:8000", "wss://127.0.0.1:8000",
+  ];
+  let out = content;
+  for (const p of httpPatterns)
+    for (const q of ['"', "'", "`"])
+      out = out.split(`${q}${p}${q}`).join(`${q}${backendUrl}${q}`);
+  for (const p of wsPatterns)
+    for (const q of ['"', "'", "`"])
+      out = out.split(`${q}${p}${q}`).join(`${q}${wsUrl}${q}`);
+  out = out
+    .replace(/https?:\/\/localhost:8000/g, backendUrl)
+    .replace(/https?:\/\/127\.0\.0\.1:8000/g, backendUrl)
+    .replace(/wss?:\/\/localhost:8000/g, wsUrl)
+    .replace(/wss?:\/\/127\.0\.0\.1:8000/g, wsUrl);
+  return out;
 }
 
-function replaceUrlPrefixes(content: string, prefixes: string[], replacement: string) {
-  let patched = content;
-
-  for (const prefix of prefixes) {
-    patched = patched.replaceAll(prefix, replacement);
-  }
-
-  return patched;
-}
-
-function patchBackendUrl(content: string, backendUrl: string) {
-  const websocketUrl = toWebsocketUrl(backendUrl);
-  let patched = replaceQuotedPlaceholders(
-    content,
-    [
-      "BACKEND_URL",
-      "http://BACKEND_URL",
-      "https://BACKEND_URL",
-      "localhost:8000",
-      "http://localhost:8000",
-      "https://localhost:8000"
-    ],
-    backendUrl
-  );
-
-  patched = replaceUrlPrefixes(
-    patched,
-    [
-      "http://BACKEND_URL",
-      "https://BACKEND_URL",
-      "http://localhost:8000",
-      "https://localhost:8000",
-      "http://127.0.0.1:8000",
-      "https://127.0.0.1:8000"
-    ],
-    backendUrl
-  );
-
-  patched = replaceQuotedPlaceholders(
-    patched,
-    [
-      "WS_BACKEND_URL",
-      "ws://WS_BACKEND_URL",
-      "wss://WS_BACKEND_URL",
-      "ws://localhost:8000",
-      "wss://localhost:8000"
-    ],
-    websocketUrl
-  );
-
-  patched = replaceUrlPrefixes(
-    patched,
-    [
-      "ws://WS_BACKEND_URL",
-      "wss://WS_BACKEND_URL",
-      "ws://BACKEND_URL",
-      "wss://BACKEND_URL",
-      "ws://localhost:8000",
-      "wss://localhost:8000",
-      "ws://127.0.0.1:8000",
-      "wss://127.0.0.1:8000"
-    ],
-    websocketUrl
-  );
-
-  return patched;
-}
-
-function normalizeStartCommand(command: string) {
-  return command
+function normalizeStartCmd(cmd: string) {
+  let out = cmd
     .replaceAll("127.0.0.1", "0.0.0.0")
     .replaceAll("localhost", "0.0.0.0")
-    .replace(/uvicorn\s+main:app(?![^&\n]*--host)/, "uvicorn main:app --host 0.0.0.0")
-    .replace(/python3?\s+-m\s+http\.server\s+3000(?![^&\n]*--bind)/, FRONTEND_FALLBACK_COMMAND);
+    .replace(/uvicorn\s+(\S+)(?![^&\n]*--host)/g, "uvicorn $1 --host 0.0.0.0")
+    .replace(/python3?\s+-m\s+http\.server\s+(\d+)(?![^&\n]*--bind)/g,
+      "python3 -m http.server $1 --bind 0.0.0.0")
+    .replace(/\s*&\s*$/, "")
+    .trim();
+
+  return out;
 }
 
-async function isPortOpen(sandbox: Sandbox, port: number) {
-  const result = await sandbox.commands.run(
-    `python3 - <<'PY'\nimport socket, sys\ns = socket.socket()\ns.settimeout(1)\ntry:\n    s.connect(('127.0.0.1', ${port}))\nexcept OSError:\n    sys.exit(1)\nfinally:\n    s.close()\nPY`,
-    {
-      cwd: WORKDIR,
-      timeoutMs: 5000
-    }
-  ).catch(() => null);
-
-  return !!result;
+async function run(sandbox: Sandbox, cmd: string, opts: { cwd?: string; timeoutMs?: number } = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const result = await sandbox.commands
+    .run(cmd, { cwd: opts.cwd ?? WORKDIR, timeoutMs: opts.timeoutMs ?? 0 })
+    .catch((e: unknown) => ({ exitCode: 1, stdout: "", stderr: String(e) }));
+  return result as { exitCode: number; stdout: string; stderr: string };
 }
 
-async function waitForPort(sandbox: Sandbox, port: number, timeoutMs = 12000) {
-  const startedAt = Date.now();
+async function isPortOpen(sandbox: Sandbox, port: number): Promise<boolean> {
+  const r = await run(sandbox,
+    `python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); s.connect(('127.0.0.1',${port})); s.close()"`
+  );
+  return r.exitCode === 0;
+}
 
-  while (Date.now() - startedAt < timeoutMs) {
-    if (await isPortOpen(sandbox, port)) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+async function waitForPort(sandbox: Sandbox, port: number, timeoutMs = 60_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isPortOpen(sandbox, port)) return true;
+    await new Promise((r) => setTimeout(r, 1000));
   }
-
   return false;
 }
 
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as unknown;
-
-    if (!isGeneratedApp(body)) {
-      return NextResponse.json(
-        { error: "Request body must include files, install_commands, and start_commands." },
-        { status: 400 }
-      );
-    }
-
-    if (!process.env.E2B_API_KEY) {
-      return NextResponse.json(
-        { error: "Missing E2B_API_KEY in the server environment." },
-        { status: 500 }
-      );
-    }
+    if (!isGeneratedApp(body))
+      return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
+    if (!process.env.E2B_API_KEY)
+      return NextResponse.json({ error: "Missing E2B_API_KEY." }, { status: 500 });
 
     const sandbox = await Sandbox.create({
       apiKey: process.env.E2B_API_KEY,
-      timeoutMs: TEN_MINUTES_MS
+      timeoutMs: TEN_MINUTES_MS,
     });
 
     const backendUrl = normalizePublicUrl(sandbox.getHost(8000));
@@ -176,57 +116,104 @@ export async function POST(request: Request) {
 
     await sandbox.files.makeDir(WORKDIR);
 
+    // Write all files
+    let hasViteConfig = false;
     for (const [filename, content] of Object.entries(body.files)) {
       const safeName = filename.replace(/^\/+/, "");
-      await sandbox.files.write(
-        `${WORKDIR}/${safeName}`,
-        patchBackendUrl(content, backendUrl)
+      let patched = patchContent(String(typeof content === "object" ? JSON.stringify(content, null, 2) : content), backendUrl);
+      if (safeName === "vite.config.js" || safeName === "vite.config.ts") {
+        patched = FORCED_VITE_CONFIG;
+        hasViteConfig = true;
+      }
+      // Ensure nested dirs exist
+      const dir = safeName.includes("/") ? safeName.split("/").slice(0, -1).join("/") : "";
+      if (dir) await sandbox.files.makeDir(`${WORKDIR}/${dir}`);
+      await sandbox.files.write(`${WORKDIR}/${safeName}`, patched);
+    }
+    if (!hasViteConfig && (body.files["src/main.jsx"] || body.files["src/main.tsx"])) {
+      await sandbox.files.write(`${WORKDIR}/vite.config.js`, FORCED_VITE_CONFIG);
+    }
+
+    // Install
+    for (const cmd of body.install_commands) {
+      const fastCmd = cmd.replace(/\bpip3?\s+install\b/g, "pip install --cache-dir /tmp/pip-cache -q");
+      console.log("[run] install:", fastCmd);
+      const result = await run(sandbox, fastCmd);
+      if (result.exitCode !== 0) {
+        const detail = (result.stderr || result.stdout).slice(-1500);
+        await sandbox.kill().catch(() => {});
+        return NextResponse.json(
+          {
+            error: `Install failed: ${cmd}`,
+            logs: `--- INSTALL ERROR ---\n${detail}`,
+            fixable: true,
+          },
+          { status: 422 }
+        );
+      }
+    }
+
+    // Start all processes — capture logs to files so we can read errors on failure
+    const cmds = body.start_commands.map((cmd: string) => normalizeStartCmd(cmd));
+    const hasFrontendCmd = cmds.some((c: string) => /vite|http\.server|3000/.test(c));
+    if (!hasFrontendCmd && body.files["index.html"] && !body.files["src/main.jsx"]) {
+      cmds.push("python3 -m http.server 3000 --bind 0.0.0.0");
+    }
+
+    console.log("[run] starting commands:", cmds);
+
+    for (const cmd of cmds) {
+      const isFrontend = /\bvite\b/.test(cmd);
+      const finalCmd = isFrontend
+        ? `npx vite --config ${WORKDIR}/vite.config.js --host 0.0.0.0 --port 3000`
+        : cmd;
+      const logFile = isFrontend ? `${WORKDIR}/.frontend.log` : `${WORKDIR}/.backend.log`;
+      // Wrap in a login shell so stdout/stderr are captured to a log file
+      console.log("[run] starting:", finalCmd);
+      await sandbox.commands.run(
+        `bash -lc "cd ${WORKDIR} && ${finalCmd} > ${logFile} 2>&1"`,
+        { cwd: WORKDIR, background: true, timeoutMs: 0 }
       );
     }
 
-    for (const command of body.install_commands) {
-      await sandbox.commands.run(command, {
-        cwd: WORKDIR,
-        timeoutMs: 180000
-      });
-    }
+    // Give processes a moment to boot / fail
+    await new Promise((r) => setTimeout(r, 3000));
 
-    for (const command of body.start_commands) {
-      await sandbox.commands.run(normalizeStartCommand(command), {
-        cwd: WORKDIR,
-        background: true
-      });
-    }
-
-    if (!(await waitForPort(sandbox, 3000, 5000)) && body.files["index.html"]) {
-      await sandbox.commands.run(FRONTEND_FALLBACK_COMMAND, {
-        cwd: WORKDIR,
-        background: true
-      });
-    }
-
-    const frontendReady = await waitForPort(sandbox, 3000);
-    const backendReady = await waitForPort(sandbox, 8000, 5000);
+    const frontendReady = await waitForPort(sandbox, 3000, 60_000);
 
     if (!frontendReady) {
-      throw new Error("Frontend server did not start on port 3000.");
+      // Gather diagnostics to feed the auto-fixer
+      const feLog = (await run(sandbox, `tail -n 60 ${WORKDIR}/.frontend.log 2>/dev/null || true`)).stdout;
+      const beLog = (await run(sandbox, `tail -n 60 ${WORKDIR}/.backend.log 2>/dev/null || true`)).stdout;
+      const logs = [
+        feLog.trim() && `--- FRONTEND LOG ---\n${feLog.trim()}`,
+        beLog.trim() && `--- BACKEND LOG ---\n${beLog.trim()}`,
+      ].filter(Boolean).join("\n\n");
+
+      await sandbox.kill().catch(() => {});
+
+      return NextResponse.json(
+        {
+          error: "Frontend did not start on port 3000.",
+          logs: logs || "(no logs captured)",
+          fixable: true,
+        },
+        { status: 422 }
+      );
     }
+
+    const backendReady = await waitForPort(sandbox, 8000, 10_000);
 
     return NextResponse.json({
       frontend_url: frontendUrl,
       backend_url: backendUrl,
       sandbox_id: sandbox.sandboxId,
-      backend_ready: backendReady
+      backend_ready: backendReady,
     });
   } catch (error) {
-    console.error("Run API failed", error);
+    console.error("Run API failed:", error);
     return NextResponse.json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to create or run the sandbox."
-      },
+      { error: error instanceof Error ? error.message : "Failed to run sandbox." },
       { status: 500 }
     );
   }

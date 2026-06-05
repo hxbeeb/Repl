@@ -10,6 +10,7 @@ export type RunResult = {
   frontend_url: string;
   backend_url: string;
   sandbox_id: string;
+  backend_ready: boolean;
 };
 
 export type ProgressState =
@@ -18,5 +19,6 @@ export type ProgressState =
   | "sandbox"
   | "installing"
   | "starting"
+  | "fixing"
   | "ready"
   | "error";
