@@ -257,7 +257,7 @@ function BuilderInner() {
 
       // Attempt an AI fix
       setProgress("fixing");
-      setFixInfo({ attempt: attempt + 1, message: "Detected an error — asking AI to fix it…" });
+      setFixInfo({ attempt: attempt + 1, message: res.error || "Detected an error — asking AI to fix it…" });
       try {
         const fixed = await postJson<GeneratedApp>("/api/fix", {
           current: currentApp,
@@ -282,6 +282,7 @@ function BuilderInner() {
   async function handleBuild(e: FormEvent) {
     e.preventDefault();
     if (!prompt.trim() || isBusy) return;
+    if (!session) { signIn("google"); return; }
     setError("");
     setGenerated(null);
     setRun(null);
@@ -342,8 +343,14 @@ function BuilderInner() {
     return (
       <header className="topbar">
         <button className="topbar-brand" onClick={handleNew} style={{ background: "none", border: "none", cursor: "pointer" }}>
-          <span className="topbar-brand-dot" />
-          Builder
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="24" height="24" rx="5" fill="black"/>
+            <rect x="9" y="2" width="6" height="6" rx="1" fill="white"/>
+            <rect x="2" y="9" width="6" height="6" rx="1" fill="white"/>
+            <rect x="16" y="9" width="6" height="6" rx="1" fill="white"/>
+            <rect x="9" y="16" width="6" height="6" rx="1" fill="white"/>
+          </svg>
+          Repl
         </button>
 
         {hasProject && (
@@ -429,7 +436,7 @@ function BuilderInner() {
         <div className="landing">
           <div className="landing-hero">
             <h1>What do you want to build?</h1>
-            <p>Describe an app and Gemini writes the code. E2B runs it live in seconds.</p>
+            <p>Describe your app. Repl generates the code and runs it live in seconds.</p>
           </div>
           <form className="landing-form" onSubmit={handleBuild}>
             <textarea
@@ -463,7 +470,7 @@ function BuilderInner() {
                 className="btn btn-primary btn-lg"
                 disabled={isBusy || !prompt.trim()}
               >
-                {isBusy ? (PROGRESS_LABELS[progress] ?? "Building…") : "Build app →"}
+                {isBusy ? (PROGRESS_LABELS[progress] ?? "Building…") : session ? "Build app →" : "Sign in to build →"}
               </button>
             </div>
             {error && <div className="error-bar" style={{ borderRadius: 6, borderTop: "none", border: "1px solid rgba(248,81,73,0.25)" }}>{error}</div>}

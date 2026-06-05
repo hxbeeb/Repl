@@ -153,6 +153,88 @@ function stripCodeFence(text: string) {
     .trim();
 }
 
+/**
+ * Salvage complete files from a TRUNCATED response.
+ * Walks the "files" object character-by-character respecting JSON string escaping,
+ * collecting only fully-closed "name": "content" pairs and discarding the one that
+ * got cut off mid-stream. Returns null if nothing usable is found.
+ */
+function salvageTruncated(stripped: string): { files: Record<string, string>; install_commands: string[]; start_commands: string[] } | null {
+  const filesKey = stripped.search(/"files"\s*:\s*\{/);
+  if (filesKey === -1) return null;
+
+  // position just after the opening brace of the files object
+  let i = stripped.indexOf("{", filesKey + 7) + 1;
+  const files: Record<string, string> = {};
+
+  // Reads a JSON string starting at index `start` (which must point at the opening quote).
+  // Returns [decodedValue, indexAfterClosingQuote] or null if the string never closes (truncated).
+  function readString(start: number): [string, number] | null {
+    if (stripped[start] !== '"') return null;
+    let out = "";
+    let j = start + 1;
+    while (j < stripped.length) {
+      const ch = stripped[j];
+      if (ch === "\\") {
+        const next = stripped[j + 1];
+        if (next === undefined) return null; // truncated mid-escape
+        const map: Record<string, string> = { n: "\n", t: "\t", r: "\r", '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f" };
+        if (next === "u") {
+          const hex = stripped.slice(j + 2, j + 6);
+          if (hex.length < 4) return null;
+          out += String.fromCharCode(parseInt(hex, 16));
+          j += 6;
+        } else {
+          out += map[next] ?? next;
+          j += 2;
+        }
+      } else if (ch === '"') {
+        return [out, j + 1];
+      } else {
+        out += ch;
+        j++;
+      }
+    }
+    return null; // never closed → truncated
+  }
+
+  while (i < stripped.length) {
+    // skip whitespace/commas
+    while (i < stripped.length && /[\s,]/.test(stripped[i])) i++;
+    if (stripped[i] === "}") break; // end of files object
+    if (stripped[i] !== '"') break; // unexpected → stop
+
+    const keyRes = readString(i);
+    if (!keyRes) break;
+    const [key, afterKey] = keyRes;
+
+    let k = afterKey;
+    while (k < stripped.length && /[\s:]/.test(stripped[k])) k++;
+    if (stripped[k] !== '"') break;
+
+    const valRes = readString(k);
+    if (!valRes) break; // value truncated → discard this last file, keep the rest
+    const [val, afterVal] = valRes;
+
+    files[key] = val;
+    i = afterVal;
+  }
+
+  if (Object.keys(files).length === 0) return null;
+
+  // Pull install/start commands if present in the (possibly truncated) tail
+  const installMatch = stripped.match(/"install_commands"\s*:\s*\[([\s\S]*?)\]/);
+  const startMatch = stripped.match(/"start_commands"\s*:\s*\[([\s\S]*?)\]/);
+  const parseCmds = (s: string | undefined) =>
+    s ? [...s.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1].replace(/\\"/g, '"')) : [];
+
+  return {
+    files,
+    install_commands: parseCmds(installMatch?.[1]),
+    start_commands: parseCmds(startMatch?.[1]),
+  };
+}
+
 function tryParseJson(raw: string): unknown {
   try { return JSON.parse(raw); } catch { /* fall through */ }
 
@@ -162,6 +244,13 @@ function tryParseJson(raw: string): unknown {
   const match = stripped.match(/\{[\s\S]*\}/);
   if (match) {
     try { return JSON.parse(match[0]); } catch { /* fall through */ }
+  }
+
+  // Last resort: salvage complete files from a truncated response.
+  const salvaged = salvageTruncated(stripped);
+  if (salvaged) {
+    console.warn(`[codegen] response truncated — salvaged ${Object.keys(salvaged.files).length} complete files`);
+    return salvaged;
   }
 
   throw new Error("The model did not return a valid JSON object. The response may have been truncated.");
@@ -193,17 +282,18 @@ export function parseGeneratedApp(text: string): GeneratedApp {
     })
   );
 
-  if (!Array.isArray(candidate.install_commands)) {
-    throw new Error("Generated app response is missing install_commands.");
-  }
+  // Default commands for the React+Vite+Express stack — used when the response was
+  // truncated before the command arrays (they come after "files" in the output).
+  const DEFAULT_INSTALL = ["npm install"];
+  const DEFAULT_START = ["node server.js", "npx vite --host 0.0.0.0 --port 3000"];
 
-  if (!Array.isArray(candidate.start_commands)) {
-    throw new Error("Generated app response is missing start_commands.");
-  }
+  const install = Array.isArray(candidate.install_commands) && candidate.install_commands.length
+    ? candidate.install_commands.map(String)
+    : DEFAULT_INSTALL;
 
-  return {
-    files,
-    install_commands: candidate.install_commands.map(String),
-    start_commands: candidate.start_commands.map(String),
-  };
+  const start = Array.isArray(candidate.start_commands) && candidate.start_commands.length
+    ? candidate.start_commands.map(String)
+    : DEFAULT_START;
+
+  return { files, install_commands: install, start_commands: start };
 }
