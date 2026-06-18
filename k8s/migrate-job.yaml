@@ -23,7 +23,11 @@ spec:
       containers:
         - name: migrate
           image: IMAGE_PLACEHOLDER
-          command: ["npx", "prisma", "migrate", "deploy"]
+          # Invoke the prisma CLI by its entrypoint directly — the standalone
+          # runtime image doesn't expose the node_modules/.bin/prisma symlink
+          # that `npx prisma` relies on.
+          command: ["node", "node_modules/prisma/build/index.js", "migrate", "deploy"]
+          workingDir: /app
           envFrom:
             - secretRef:
                 name: repl-secrets
