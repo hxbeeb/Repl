@@ -55,12 +55,22 @@ pipeline {
         sh '''
           set -e
           JOB=repl-migrate-${IMAGE_TAG}
+          # Delete any prior Job of this name so we always run a FRESH migration
+          # (re-applying an existing/completed Job is a no-op and never re-runs).
+          kubectl -n ${NAMESPACE} delete job ${JOB} --ignore-not-found --wait=true
           sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
               -e "s|name: repl-migrate|name: ${JOB}|" \
               k8s/migrate-job.yaml | kubectl apply -f -
-          kubectl -n ${NAMESPACE} wait --for=condition=complete --timeout=300s job/${JOB} \
-            || (kubectl -n ${NAMESPACE} logs job/${JOB} --tail=200; exit 1)
-          kubectl -n ${NAMESPACE} logs job/${JOB} --tail=200
+
+          # Wait for either success or failure, then always dump pod logs.
+          kubectl -n ${NAMESPACE} wait --for=condition=complete --timeout=300s job/${JOB} & cpid=$!
+          kubectl -n ${NAMESPACE} wait --for=condition=failed --timeout=300s job/${JOB} & fpid=$!
+          wait -n $cpid $fpid || true
+          echo "----- migrate logs -----"
+          kubectl -n ${NAMESPACE} logs job/${JOB} --tail=200 || true
+          echo "------------------------"
+          # Succeed only if the Job actually completed.
+          kubectl -n ${NAMESPACE} wait --for=condition=complete --timeout=10s job/${JOB}
         '''
       }
     }

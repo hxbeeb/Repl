@@ -8,8 +8,8 @@ metadata:
   labels:
     app: repl
 spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 600
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 1800
   template:
     metadata:
       labels:
