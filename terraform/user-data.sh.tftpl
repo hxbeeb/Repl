@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Cloud-init bootstrap for the Repl EC2 host (Ubuntu 22.04).
+# Installs: swap, Docker, k3s (single-node k8s), Jenkins (container) wired to
+# both the host Docker socket and the k3s kubeconfig.
+set -euxo pipefail
+exec > /var/log/repl-bootstrap.log 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+# --- Swap (safety margin even on 4GB during builds) ---
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# --- Base packages + Docker ---
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg git
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+# --- k3s (single-node Kubernetes); kubectl is bundled ---
+curl -sfL https://get.k3s.io | sh -
+# Make kubeconfig readable by the ubuntu user and the Jenkins container.
+mkdir -p /home/ubuntu/.kube
+cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+# k3s.yaml points at 127.0.0.1; rewrite to the host's private IP so the
+# Jenkins container (its own net namespace) can reach the API server.
+PRIVATE_IP=$(hostname -I | awk '{print $1}')
+sed -i "s/127.0.0.1/$${PRIVATE_IP}/" /home/ubuntu/.kube/config
+chown -R ubuntu:ubuntu /home/ubuntu/.kube
+echo 'export KUBECONFIG=/home/ubuntu/.kube/config' >> /home/ubuntu/.bashrc
+
+# --- Jenkins: pre-seed config so it boots ready (no setup wizard) ---
+# A named volume holds Jenkins home; we drop files into it BEFORE first start.
+docker volume create jenkins_home
+JHOME=$(docker volume inspect -f '{{.Mountpoint}}' jenkins_home)
+
+# Plugins the pipeline needs (resolved with deps by jenkins-plugin-cli).
+mkdir -p "$${JHOME}"
+cat > "$${JHOME}/plugins.txt" <<'EOF'
+git
+workflow-aggregator
+credentials-binding
+github
+github-branch-source
+docker-workflow
+configuration-as-code
+EOF
+
+# Groovy init: create the admin user + mark setup complete (skip the wizard).
+mkdir -p "$${JHOME}/init.groovy.d"
+cat > "$${JHOME}/init.groovy.d/01-admin.groovy" <<EOF
+import jenkins.model.*
+import hudson.security.*
+import jenkins.install.InstallState
+def inst = Jenkins.get()
+def realm = new HudsonPrivateSecurityRealm(false)
+realm.createAccount("admin", "${admin_password}")
+inst.setSecurityRealm(realm)
+def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+strategy.setAllowAnonymousRead(false)
+inst.setAuthorizationStrategy(strategy)
+inst.setInstallState(InstallState.INITIAL_SETUP_COMPLETED)
+inst.save()
+EOF
+
+chown -R 1000:1000 "$${JHOME}"
+
+# Install plugins into the volume before starting Jenkins.
+docker run --rm -v jenkins_home:/var/jenkins_home ${jenkins_image} \
+  jenkins-plugin-cli --plugin-file /var/jenkins_home/plugins.txt \
+  --plugin-download-directory /var/jenkins_home/plugins
+
+# --- Start Jenkins, with Docker socket + kubeconfig mounted ---
+docker run -d --name jenkins --restart unless-stopped \
+  -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /usr/bin/docker:/usr/bin/docker \
+  -v /home/ubuntu/.kube/config:/var/jenkins_home/.kube/config:ro \
+  -e KUBECONFIG=/var/jenkins_home/.kube/config \
+  -e JAVA_OPTS="-Djenkins.install.runSetupWizard=false" \
+  --group-add "$(getent group docker | cut -d: -f3)" \
+  ${jenkins_image}
+
+# Install kubectl inside the Jenkins container so pipeline stages can deploy.
+sleep 10
+docker exec -u root jenkins bash -c '
+  curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" &&
+  install -m 0755 kubectl /usr/local/bin/kubectl && rm kubectl
+'
+
+echo "BOOTSTRAP COMPLETE" >> /var/log/repl-bootstrap.log

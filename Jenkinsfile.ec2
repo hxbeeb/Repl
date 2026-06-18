@@ -1,0 +1,90 @@
+// EC2 single-node pipeline (small instance).
+// Builds with the host Docker daemon (lighter than Kaniko-in-pod) and deploys
+// to a local k3s cluster. Jenkins runs as a container on the same EC2 host,
+// with the host Docker socket and k3s kubeconfig mounted in.
+//
+// Requires on the Jenkins container/agent:
+//   - docker CLI + access to /var/run/docker.sock
+//   - kubectl + KUBECONFIG pointing at k3s (/etc/rancher/k3s/k3s.yaml)
+//   - Jenkins credentials:
+//       'dockerhub'  -> username/password (Docker Hub user + access token)
+pipeline {
+  agent any
+
+  environment {
+    REGISTRY   = 'docker.io/hxbeeb'
+    IMAGE_NAME = 'repl'
+    IMAGE_TAG  = "${env.GIT_COMMIT?.take(12) ?: env.BUILD_NUMBER}"
+    IMAGE      = "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+    NAMESPACE  = 'repl'
+  }
+
+  options {
+    timeout(time: 40, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Build & Push image') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: 'dockerhub',
+          usernameVariable: 'DH_USER',
+          passwordVariable: 'DH_PASS')]) {
+          sh '''
+            set -e
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            # Single-arch build on the host daemon — light enough for a small box.
+            docker build -t ${IMAGE} -t ${REGISTRY}/${IMAGE_NAME}:latest .
+            docker push ${IMAGE}
+            docker push ${REGISTRY}/${IMAGE_NAME}:latest
+            # Free disk on a small instance: drop dangling layers after push.
+            docker image prune -f || true
+          '''
+        }
+      }
+    }
+
+    stage('DB migrate') {
+      steps {
+        sh '''
+          set -e
+          JOB=repl-migrate-${IMAGE_TAG}
+          sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+              -e "s|name: repl-migrate|name: ${JOB}|" \
+              k8s/migrate-job.yaml | kubectl apply -f -
+          kubectl -n ${NAMESPACE} wait --for=condition=complete --timeout=300s job/${JOB} \
+            || (kubectl -n ${NAMESPACE} logs job/${JOB} --tail=200; exit 1)
+          kubectl -n ${NAMESPACE} logs job/${JOB} --tail=200
+        '''
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        sh '''
+          set -e
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/service.yaml
+          # NOTE: HPA needs metrics-server; skip on a tiny single node if not installed.
+          kubectl apply -f k8s/hpa.yaml || echo "HPA skipped (metrics-server not installed?)"
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
+          kubectl -n ${NAMESPACE} set image deployment/repl web=${IMAGE}
+          kubectl -n ${NAMESPACE} rollout status deployment/repl --timeout=300s
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo "Deployed ${IMAGE} to ${NAMESPACE}" }
+    failure {
+      sh 'kubectl -n ${NAMESPACE} rollout undo deployment/repl || true'
+    }
+  }
+}

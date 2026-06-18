@@ -1,0 +1,8 @@
+# Terraform state contains secrets and infra details — never commit.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+crash.log
+*.pem
