@@ -28,16 +28,25 @@ fi
 
 $KC create namespace "$NS" >/dev/null 2>&1 || true
 
-# Build a clean env file: drop comments/blanks and the .env NEXTAUTH_URL,
-# then append the production one.
-TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
-grep -vE '^[[:space:]]*#|^[[:space:]]*$|^NEXTAUTH_URL=' "$ENV_FILE" > "$TMP"
-echo "NEXTAUTH_URL=${PROD_URL}" >> "$TMP"
+# Parse .env into --from-literal args, STRIPPING surrounding quotes.
+# (--from-env-file keeps literal quotes, which breaks values like
+#  DATABASE_URL="postgresql://..." → Prisma rejects the leading quote.)
+ARGS=()
+while IFS= read -r line; do
+  case "$line" in ''|'#'*) continue ;; esac
+  key=${line%%=*}
+  val=${line#*=}
+  # Trim surrounding double or single quotes.
+  val=${val#\"}; val=${val%\"}
+  val=${val#\'}; val=${val%\'}
+  [ "$key" = "NEXTAUTH_URL" ] && continue   # force prod value below
+  ARGS+=("--from-literal=${key}=${val}")
+done < "$ENV_FILE"
+ARGS+=("--from-literal=NEXTAUTH_URL=${PROD_URL}")
 
 # Apply (idempotent — re-running updates the secret in place).
 $KC -n "$NS" create secret generic repl-secrets \
-  --from-env-file="$TMP" \
+  "${ARGS[@]}" \
   --dry-run=client -o yaml | $KC apply -f -
 
 echo
