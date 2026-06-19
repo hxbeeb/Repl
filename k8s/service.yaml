@@ -6,8 +6,8 @@ metadata:
   labels:
     app: repl
 spec:
-  # NodePort so the app is reachable directly at http://<EC2_IP>:30080
-  # (IP-only access, no domain/ingress needed).
+  # NodePort on 80 so the app is reachable directly at http://<EC2_IP>
+  # (IP-only access; Traefik disabled in k3s, NodePort range widened to 80).
   type: NodePort
   selector:
     app: repl
@@ -15,4 +15,4 @@ spec:
     - name: http
       port: 80
       targetPort: http
-      nodePort: 30080
+      nodePort: 80
