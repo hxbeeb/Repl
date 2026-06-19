@@ -81,8 +81,6 @@ pipeline {
           set -e
           kubectl apply -f k8s/namespace.yaml
           kubectl apply -f k8s/service.yaml
-          # NOTE: HPA needs metrics-server; skip on a tiny single node if not installed.
-          kubectl apply -f k8s/hpa.yaml || echo "HPA skipped (metrics-server not installed?)"
           sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
           kubectl -n ${NAMESPACE} set image deployment/repl web=${IMAGE}
           kubectl -n ${NAMESPACE} rollout status deployment/repl --timeout=300s

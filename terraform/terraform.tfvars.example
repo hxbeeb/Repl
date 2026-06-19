@@ -1,7 +1,0 @@
-# Copy to terraform.tfvars and fill in. Do NOT commit terraform.tfvars.
-region                 = "ap-south-1"
-key_name               = "your-ec2-keypair-name"   # an EXISTING key pair in ap-south-1
-admin_cidr             = "1.2.3.4/32"              # YOUR public IP — locks down SSH + Jenkins
-instance_type          = "t3.medium"
-disk_gb                = 30
-jenkins_admin_password = "change-me-strong-password" # Jenkins 'admin' login
